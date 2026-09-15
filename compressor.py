@@ -1,120 +1,145 @@
-import os
-import re
-import shutil
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow>=11", "tqdm>=4.66"]
+# ///
 
-import multiprocessing.pool
+import argparse
+import multiprocessing
+import os
+import shutil
+import string
+import sys
+from functools import partial
+from pathlib import Path
 
 import tqdm
-
 from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+JPEG_SUFFIXES = {".jpg", ".jpeg"}
+JUNK_PREFIX = "._"
+CAMERA_DIR = "DCIM"
+STAGING_DIR = ".staging"
+DEFAULT_SCALE = 3
+DEFAULT_QUALITY = 80
+MAX_JOBS = 8
+PHOTOS_PER_BATCH = 200
+MOUNT_GLOBS = ("media/*/*", "run/media/*/*", "mnt/*", "Volumes/*")
 
-CAM_ADDRESS = "/media/ptym/0123-4567/DCIM/130MSDCF"
-DST_ADDRESS = os.getcwd()
-THREADS = 16
+
+def find_photos(folder: Path) -> list[Path]:
+    return sorted(
+        path for path in folder.rglob("*")
+        if path.suffix.lower() in JPEG_SUFFIXES and not path.name.startswith(JUNK_PREFIX)
+    )
 
 
-def to_uncompressed_filename(name: str) -> str:
-    return re.sub(r"(.*)-\d+.compressed.JPG", rf"\1.JPG", name)
-
-
-def get_oldest_file(address: str = DST_ADDRESS):
-    files = [
-        file
-        for file
-        in os.listdir(address)
-        if re.match(r".*\.JPG$", file)
-    ]
-    if not files:
-        return None
+def find_cards() -> list[Path]:
+    if os.name == "nt":
+        roots = [Path(f"{letter}:/") for letter in string.ascii_uppercase[2:]]
     else:
-        return list(sorted(files))[-1]
+        roots = [path for glob in MOUNT_GLOBS for path in Path("/").glob(glob)]
+    return [root / CAMERA_DIR for root in roots if (root / CAMERA_DIR).is_dir()]
 
 
-def get_files_to_copy(address: str = CAM_ADDRESS) -> list[str]:
-    oldest_file = get_oldest_file(DST_ADDRESS) or "DSC00000-0.compressed.JPG"
-    print(f"oldest file on `{DST_ADDRESS}` is `{oldest_file}`")
-    uncompressed_oldest_name = to_uncompressed_filename(oldest_file)
-    print(f"lookinf for files bigger than `{uncompressed_oldest_name}` from `{CAM_ADDRESS}`")
+def ask_for_source() -> Path | None:
+    print(f"No --source given, looking for a {CAMERA_DIR} folder on removable drives...\n")
+    cards = find_cards()
+    if not cards:
+        print(r"Found none. Re-run like:  uv run compressor.py --source E:\DCIM")
+        return None
+    for number, path in enumerate(cards, start=1):
+        print(f"  [{number}] {path}  ({len(find_photos(path))} photos)")
+    print("  [q] quit, I will pass --source myself\n")
+    answer = input("pick one: ").strip()
+    if answer.isdigit() and 1 <= int(answer) <= len(cards):
+        return cards[int(answer) - 1]
+    return None
 
-    files = [
-        file
-        for file
-        in os.listdir(address)
-        if re.match(r"DSC\d{5}\.JPG$", file) and (file > uncompressed_oldest_name)
+
+def copy_from_card(card_path: Path, staged_path: Path) -> None:
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = staged_path.with_suffix(staged_path.suffix + ".part")
+    shutil.copy2(card_path, partial_path)
+    os.replace(partial_path, staged_path)
+
+
+def compress(task: tuple[str, str], scale: int, quality: int) -> tuple[str, str | None]:
+    staged_path, out_path = Path(task[0]), Path(task[1])
+    try:
+        with Image.open(staged_path) as image:
+            keep = {key: image.info[key] for key in ("exif", "icc_profile") if image.info.get(key)}
+            smaller = image.resize(
+                (max(1, image.width // scale), max(1, image.height // scale)),
+                Image.Resampling.LANCZOS,
+            )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        smaller.save(out_path, quality=quality, **keep)
+        os.utime(out_path, (staged_path.stat().st_mtime,) * 2)
+        return task[1], None
+    except Exception as error:
+        out_path.unlink(missing_ok=True)
+        return task[1], f"{type(error).__name__}: {error}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Compress the photos on your SD card.")
+    parser.add_argument("--source", help=f"{CAMERA_DIR} folder on the card")
+    parser.add_argument("--dest", default="compressed", help="where compressed photos go")
+    parser.add_argument("--scale", type=int, default=DEFAULT_SCALE, help="shrink each side by this much")
+    parser.add_argument("--quality", type=int, default=DEFAULT_QUALITY, help="JPEG quality, 1..100")
+    parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 4, MAX_JOBS),
+                        help="photos compressed at once")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    source = Path(args.source) if args.source else ask_for_source()
+    if source is None:
+        return 1
+    if not source.is_dir():
+        print(f"not a folder: {source}")
+        return 1
+
+    dest = Path(args.dest).resolve()
+    staging = dest / STAGING_DIR
+    tasks = [
+        (photo, staging / photo.relative_to(source), dest / photo.relative_to(source))
+        for photo in find_photos(source)
+        if not (dest / photo.relative_to(source)).exists()
     ]
-    print(f"found {len(files)} files")
-    return files
+    print(f"{len(tasks)} new photos, {source} -> {dest}")
+    if not tasks:
+        return 0
+
+    failed = []
+    worker = partial(compress, scale=args.scale, quality=args.quality)
+    pool = multiprocessing.get_context("spawn").Pool(args.jobs)
+    with pool, tqdm.tqdm(total=len(tasks), unit="photo") as progress:
+        for start in range(0, len(tasks), PHOTOS_PER_BATCH):
+            staged = []
+            for card_path, staged_path, out_path in tasks[start:start + PHOTOS_PER_BATCH]:
+                try:
+                    copy_from_card(card_path, staged_path)
+                    staged.append((str(staged_path), str(out_path)))
+                except OSError as error:
+                    failed.append((card_path, error))
+                    progress.update()
+            for name, error in pool.imap_unordered(worker, staged):
+                if error:
+                    failed.append((name, error))
+                progress.update()
+            for staged_path, _ in staged:
+                Path(staged_path).unlink(missing_ok=True)
+
+    shutil.rmtree(staging, ignore_errors=True)
+    print(f"\ndone: {len(tasks) - len(failed)} of {len(tasks)} into {dest}")
+    for name, error in failed:
+        print(f"  failed: {name}  {error}")
+    return 1 if failed else 0
 
 
-def get_files_to_compress(address: str = DST_ADDRESS) -> list[str]:
-    files = [
-        file
-        for file
-        in os.listdir(address)
-        if re.match(r"DSC\d{5}\.JPG$", file)
-    ]
-    print(f"found {len(files)} files")
-    return files
-
-
-def resize(im: Image):
-    new_width, new_height = int(im.width / 3), int(im.height / 3)
-    return im.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-
-def compress(addr: str):
-    im = Image.open(addr)
-    im = resize(im)
-
-    i = 1
-    while True:
-        new_name = re.sub(r"(.*)\.JPG", rf"\1-{i}.compressed.JPG", addr)
-        if os.path.isfile(new_name):
-            i += 1
-        else:
-            break
-
-    im.save(new_name, quality=80, exif=im.getexif())
-
-    old_stat = os.stat(addr)
-    new_stat = os.stat(new_name)
-    compression = round(new_stat.st_size / old_stat.st_size * 100, 3)
-
-    return addr, new_name, compression
-
-
-def copy_to_dst(file, pbar):
-    old = os.path.join(CAM_ADDRESS, file)
-    new = os.path.join(DST_ADDRESS, file)
-    shutil.copy(old, new)
-    pbar.write(f"copy `{old}` -> `{new}`")
-
-
-def split_chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-def main():
-    print(f"copying from `{CAM_ADDRESS}` to `{DST_ADDRESS}`")
-    with tqdm.tqdm(sorted(get_files_to_copy())) as pbar:
-        for file in pbar:
-            copy_to_dst(file, pbar)
-
-    print("compressing files")
-    files_to_compress = sorted(get_files_to_compress())
-
-    print(f"perform in {THREADS} threads")
-    with multiprocessing.pool.Pool(THREADS) as p, tqdm.tqdm(total=len(files_to_compress)) as pbar:
-        for addr, new_name, compression in p.imap(compress, files_to_compress):
-            pbar.write(f"saved `{addr}` -> `{new_name}`, new size is {compression}% of old")
-            pbar.update()
-            pbar.refresh()
-            os.remove(addr)
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())

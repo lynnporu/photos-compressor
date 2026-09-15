@@ -1,10 +1,10 @@
 [project]
 name = "photos_compressor"
-version = "0.1.0"
+version = "0.2.0"
 description = "this will compress the shit out of your photos"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
-    "pillow>=12.1.1",
-    "tqdm>=4.67.3",
+    "pillow>=11",
+    "tqdm>=4.66",
 ]
