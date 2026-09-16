@@ -75,7 +75,7 @@ def compress(task: tuple[str, str], scale: int, quality: int) -> tuple[str, str 
                 Image.Resampling.LANCZOS,
             )
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        smaller.save(out_path, quality=quality, **keep)
+        smaller.save(out_path, quality=quality, progressive=True, **keep)
         os.utime(out_path, (staged_path.stat().st_mtime,) * 2)
         return task[1], None
     except Exception as error:
